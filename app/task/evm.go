@@ -3,11 +3,15 @@ package task
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math/big"
 	"net/http"
+	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -49,11 +53,26 @@ type evm struct {
 	Client           *http.Client
 	blockScanQueue   *chanx.UnboundedChan[evmBlock]
 	LookbackInterval time.Duration // 回溯时每批入队的间隔，控制 RPC 调用速率；默认 500ms
+	scanMu           sync.Mutex
+	nextScanAt       time.Time
 }
 
 type evmBlock struct {
 	From int64
 	To   int64
+}
+
+// A root-configured replay fetches one real block through the normal scanner.
+// It never changes an order status or fabricates a transfer/callback.
+func parseEVMReplayBlock(raw string) (evmBlock, bool, error) {
+	if raw == "" {
+		return evmBlock{}, false, nil
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || n <= 0 {
+		return evmBlock{}, false, fmt.Errorf("invalid replay block %q", raw)
+	}
+	return evmBlock{From: n, To: n}, true, nil
 }
 
 func (e *evm) syncBlocksForward(ctx context.Context) {
@@ -192,6 +211,17 @@ func (e *evm) getBlockByNumber(a any) {
 		return
 	}
 
+	// Serialize each network's batches; retry failures without a tight loop.
+	e.scanMu.Lock()
+	success := false
+	defer func() {
+		e.nextScanAt = time.Now().Add(evmScanDelay(success))
+		e.scanMu.Unlock()
+	}()
+	if wait := time.Until(e.nextScanAt); wait > 0 {
+		time.Sleep(wait)
+	}
+
 	items := make([]string, 0)
 	for i := b.From; i <= b.To; i++ {
 		items = append(items, fmt.Sprintf(`{"jsonrpc":"2.0","method":"eth_getBlockByNumber","params":["0x%x",%t],"id":%d}`, i, e.Native.Parse, i))
@@ -270,6 +300,14 @@ func (e *evm) getBlockByNumber(a any) {
 	}
 
 	log.Task.Info(fmt.Sprintf("区块扫描完成(%s): %d → %d 成功率：%s", e.Network, b.From, b.To, conf.GetSuccessRate(e.Network)))
+	success = true
+}
+
+func evmScanDelay(success bool) time.Duration {
+	if success {
+		return 2 * time.Second
+	}
+	return 15 * time.Second
 }
 
 func (e *evm) parseNativeTransfer(array []gjson.Result, num int, timestamp time.Time) []transfer {
@@ -315,9 +353,35 @@ func (e *evm) parseNativeTransfer(array []gjson.Result, num int, timestamp time.
 	return nativeTransfers
 }
 
+// buildEVMLogQuery scopes log scans to registered contracts on this network.
+// Public RPC providers reject unbounded all-contract event queries.
+func buildEVMLogQuery(network string, b evmBlock) ([]byte, error) {
+	addresses := make([]string, 0)
+	for _, c := range model.GetAllTradeConfig() {
+		if string(c.Network) == network && !c.Native && c.Contract != "" {
+			addresses = append(addresses, c.Contract)
+		}
+	}
+	if len(addresses) == 0 {
+		return nil, fmt.Errorf("no registered token contracts for network %s", network)
+	}
+	sort.Strings(addresses)
+	return json.Marshal(map[string]any{
+		"jsonrpc": "2.0", "method": "eth_getLogs", "id": 1,
+		"params": []any{map[string]any{
+			"fromBlock": fmt.Sprintf("0x%x", b.From),
+			"toBlock":   fmt.Sprintf("0x%x", b.To),
+			"address":   addresses, "topics": []string{evmTransferEvent},
+		}},
+	})
+}
+
 func (e *evm) parseEventTransfer(b evmBlock, timestamp map[string]time.Time) ([]transfer, error) {
 	transfers := make([]transfer, 0)
-	post := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","method":"eth_getLogs","params":[{"fromBlock":"0x%x","toBlock":"0x%x","topics":["%s"]}],"id":1}`, b.From, b.To, evmTransferEvent))
+	post, err := buildEVMLogQuery(e.Network, b)
+	if err != nil {
+		return transfers, err
+	}
 	resp, err := e.Client.Post(e.rpcEndpoint(), "application/json", bytes.NewBuffer(post))
 	if err != nil {
 
@@ -396,7 +460,7 @@ func (e *evm) tradeConfirmHandle(ctx context.Context) {
 		}
 
 		post := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","method":"eth_getTransactionReceipt","params":["%s"],"id":1}`, o.RefHash))
-		req, err := http.NewRequestWithContext(ctx, "POST", e.rpcEndpoint(), bytes.NewBuffer(post))
+		req, err := http.NewRequestWithContext(ctx, "POST", evmReceiptEndpoint(e.Network, e.rpcEndpoint()), bytes.NewBuffer(post))
 		if err != nil {
 			log.Task.Warn("evm tradeConfirmHandle Error creating request:", err)
 
@@ -441,6 +505,15 @@ func (e *evm) tradeConfirmHandle(ctx context.Context) {
 	}
 
 	wg.Wait()
+}
+
+// Public log endpoints can deny historical receipts; scope an explicit
+// watch-only receipt provider override to its own network.
+func evmReceiptEndpoint(network, primary string) string {
+	if endpoint := os.Getenv("BEPUSDT_RECEIPT_RPC_" + strings.ToUpper(network)); endpoint != "" {
+		return endpoint
+	}
+	return primary
 }
 
 func (e *evm) rpcEndpoint() string {

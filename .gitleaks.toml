@@ -1,0 +1,14 @@
+title = "Maintained BEpusdt secret scanning"
+[extend]
+useDefault = true
+
+# Upstream API response/callback examples put the publicly known TRON USDT
+# contract address in a field named token. It is not an API credential.
+# Require BOTH the exact documentation path and exact public value; do not
+# skip entire documentation files, tests, RPC URLs, or generic-api-key rules.
+[[allowlists]]
+description = "Canonical public TRON USDT contract in upstream API examples"
+condition = "AND"
+paths = ['''^docs/api/api\.md$''']
+regexTarget = "secret"
+regexes = ['''^TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t$''']

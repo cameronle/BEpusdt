@@ -10,3 +10,23 @@ static/web
 static/secure
 *.log
 AGENTS.md
+# Private runtime/deployment state must never be committed.
+.env.*
+!.env.example
+!.env.scanner.example
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.sqlite3-*
+*.db
+*.db-*
+*.pem
+*.key
+/private/
+/backups/
+/scanner-v2/
+/node_modules/
+/web/node_modules/
+/bepusdt
+/bepusdt-*
+__pycache__/

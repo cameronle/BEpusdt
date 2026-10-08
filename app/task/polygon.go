@@ -2,6 +2,8 @@ package task
 
 import (
 	"context"
+	"github.com/v03413/bepusdt/app/model"
+	"os"
 	"time"
 
 	"github.com/smallnest/chanx"
@@ -10,6 +12,10 @@ import (
 )
 
 func polygonInit() {
+	if os.Getenv("BEPUSDT_EVM_SCANNER_V2") == "1" {
+		registerFastScanner(conf.Polygon, 137, model.UsdtPolygon, 40)
+		return
+	}
 	ctx := context.Background()
 	pol := evm{
 		Network: conf.Polygon,
